@@ -51,12 +51,28 @@ def fetch_news_headlines(query, days=90):
 def get_features_and_target(symbol_name, ticker):
     # 1. Fetch stock data
     df = yf.download(ticker, start=start, end=end)
-    df = df[['Close']]
+    if df.empty:
+        raise ValueError(f"No data returned for ticker {ticker}.")
+    if hasattr(df.columns, 'to_flat_index'):
+        df.columns = df.columns.to_flat_index()
+        # Convert single-element tuple column names to string
+        df.columns = [col[0] if isinstance(col, tuple) and len(col) == 1 else col for col in df.columns]
+    # Try to find the correct 'Close' column, including multi-index tuples
+    close_col = None
+    for candidate in [('Close', ticker), 'Close', ('Close',), (ticker, 'Close')]:
+        if candidate in df.columns:
+            close_col = candidate
+            break
+    if close_col is None:
+        raise KeyError(f"No 'Close' column found in DataFrame for ticker {ticker}. Columns: {df.columns}")
+    df = df[[close_col]].copy()
+    df.rename(columns={close_col: 'Close'}, inplace=True)
+    # Add moving averages
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA50'] = df['Close'].rolling(window=50).mean()
-    df = df.dropna()
-    df.reset_index(inplace=True)
-    df['Date'] = pd.to_datetime(df['Date']).dt.normalize()
+    df = df.reset_index()  # Ensure 'Date' is a column
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Date'] = df['Date'].dt.normalize()
 
     # 2. Fetch news + sentiment
     df_news = fetch_news_headlines(symbol_name)
@@ -67,6 +83,8 @@ def get_features_and_target(symbol_name, ticker):
         df_news['Date'] = pd.to_datetime(df_news['Date'])
         df_news['Date'] = df_news['Date'].dt.normalize()
         sentiment = df_news.groupby('Date')['Sentiment'].mean().reset_index()
+        sentiment['Date'] = pd.to_datetime(sentiment['Date'])
+        sentiment['Date'] = sentiment['Date'].dt.normalize()
         df = pd.merge(df, sentiment, on='Date', how='left')
         df['Sentiment'].fillna(0, inplace=True)
 
@@ -104,6 +122,47 @@ model.fit(X, y)
 df_all['Predicted'] = model.predict(X)
 mae = mean_absolute_error(y, df_all['Predicted'])
 print(f"\n📉 Mean Absolute Error: {mae:.2f} INR")
+
+# Create a result table for the next day's prediction for each stock
+result_rows = []
+for symbol in stock_symbols.keys():
+    stock_df = df_all[df_all['Stock'] == symbol].copy()
+    if stock_df.empty:
+        continue
+    last_row = stock_df.iloc[-1]
+    result_rows.append({
+        'Stock': symbol,
+        'Last Date': last_row['Date'].date() if hasattr(last_row['Date'], 'date') else last_row['Date'],
+        'Actual': last_row['Target'],
+        'Predicted': last_row['Predicted']
+    })
+result_df = pd.DataFrame(result_rows)
+print("\nNext Day Prediction Table:")
+print(result_df.to_string(index=False))
+
+# Predict for the next day (16th July 2025) for each stock
+next_day_rows = []
+for symbol in stock_symbols.keys():
+    stock_df = df_all[df_all['Stock'] == symbol].copy()
+    if stock_df.empty:
+        continue
+    last_row = stock_df.iloc[-1]
+    # Prepare input for prediction
+    input_features = [[
+        last_row['Close'],
+        last_row['MA20'],
+        last_row['MA50'],
+        last_row['Sentiment']
+    ]]
+    next_pred = model.predict(input_features)[0]
+    next_day_rows.append({
+        'Stock': symbol,
+        'Prediction Date': (last_row['Date'] + pd.Timedelta(days=1)).date() if hasattr(last_row['Date'], 'date') else last_row['Date'] + pd.Timedelta(days=1),
+        'Predicted': next_pred
+    })
+next_day_df = pd.DataFrame(next_day_rows)
+print("\nPrediction for Next Day (16th July 2025):")
+print(next_day_df.to_string(index=False))
 
 # Plot sample prediction for 1 stock
 sample_stock = 'INFY'
